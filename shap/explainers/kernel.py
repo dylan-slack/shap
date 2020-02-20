@@ -7,7 +7,7 @@ import logging
 import copy
 import itertools
 import warnings
-from sklearn.linear_model import LassoLarsIC, Lasso, lars_path
+from sklearn.linear_model import LassoLarsIC, Lasso, lars_path, BayesianRidge
 from sklearn.cluster import KMeans
 from tqdm.auto import tqdm
 from .explainer import Explainer
@@ -276,7 +276,7 @@ class KernelExplainer(Explainer):
         # if more than one feature varies then we have to do real work
         else:
             self.l1_reg = kwargs.get("l1_reg", "auto")
-
+        
             # pick a reasonable number of samples if the user didn't specify how many they wanted
             self.nsamples = kwargs.get("nsamples", "auto")
             if self.nsamples == "auto":
@@ -555,6 +555,8 @@ class KernelExplainer(Explainer):
                 "l1_reg=\"auto\" is deprecated and in the next version (v0.29) the behavior will change from a " \
                 "conditional use of AIC to simply \"num_features(10)\"!"
             )
+   
+            
         if (self.l1_reg not in ["auto", False, 0]) or (fraction_evaluated < 0.2 and self.l1_reg == "auto"):
             w_aug = np.hstack((self.kernelWeights * (self.M - s), self.kernelWeights * s))
             log.info("np.sum(w_aug) = {0}".format(np.sum(w_aug)))
@@ -566,7 +568,14 @@ class KernelExplainer(Explainer):
             #var_norms = np.array([np.linalg.norm(mask_aug[:, i]) for i in range(mask_aug.shape[1])])
 
             # select a fixed number of top features
-            if isinstance(self.l1_reg, str) and self.l1_reg.startswith("num_features("):
+
+            if self.l1_reg == "bayesian": 
+                br = np.nonzero(BayesianRidge().fit(mask_aug, eyAdj_aug).coef_)[0]
+
+                print (br)
+                exit()
+
+            elif isinstance(self.l1_reg, str) and self.l1_reg.startswith("num_features("):
                 r = int(self.l1_reg[len("num_features("):-1])
                 nonzero_inds = lars_path(mask_aug, eyAdj_aug, max_iter=r)[1]
             
@@ -575,6 +584,7 @@ class KernelExplainer(Explainer):
                 c = "aic" if self.l1_reg == "auto" else self.l1_reg
                 nonzero_inds = np.nonzero(LassoLarsIC(criterion=c).fit(mask_aug, eyAdj_aug).coef_)[0]
             
+
             # use a fixed regularization coeffcient
             else:
                 nonzero_inds = np.nonzero(Lasso(alpha=self.l1_reg).fit(mask_aug, eyAdj_aug).coef_)[0]
