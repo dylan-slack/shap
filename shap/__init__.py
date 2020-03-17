@@ -6,6 +6,7 @@ __version__ = '0.34.0'
 
 # explainers
 from .explainers.kernel import KernelExplainer, kmeans
+from .explainers.prob_kernel import ProbKernelExplainer
 from .explainers.sampling import SamplingExplainer
 from .explainers.tree import TreeExplainer, Tree
 from .explainers.deep import DeepExplainer

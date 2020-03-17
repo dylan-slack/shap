@@ -12,12 +12,10 @@ from sklearn.cluster import KMeans
 from tqdm.auto import tqdm
 from .explainer import Explainer
 
-from sklearn import datasets, linear_model
-from sklearn.linear_model import LinearRegression
-import statsmodels.api as sm
-from scipy import stats
-
 log = logging.getLogger('shap')
+
+import warnings
+warnings.filterwarnings('ignore') 
 
 
 def kmeans(X, k, round_values=True):
@@ -55,7 +53,7 @@ def kmeans(X, k, round_values=True):
     return DenseData(kmeans.cluster_centers_, group_names, None, 1.0*np.bincount(kmeans.labels_))
 
 
-class KernelExplainer(Explainer):
+class ProbKernelExplainer(Explainer):
     """Uses the Kernel SHAP method to explain the output of any function.
 
     Kernel SHAP is a method that uses a special weighted linear regression
@@ -187,7 +185,6 @@ class KernelExplainer(Explainer):
 
         # single instance
         if len(X.shape) == 1:
-            raise NotImplementedError("Shouldn't be getting here")
             data = X.reshape((1, X.shape[0]))
             if self.keep_index:
                 data = convert_to_instance_with_index(data, column_name, index_name, index_value)
@@ -210,29 +207,41 @@ class KernelExplainer(Explainer):
         # explain the whole dataset
         elif len(X.shape) == 2:
             explanations = []
+            sigmas = []
+            calc_rs = []
             for i in tqdm(range(X.shape[0]), disable=kwargs.get("silent", False)):
                 data = X[i:i + 1, :]
                 if self.keep_index:
                     data = convert_to_instance_with_index(data, column_name, index_value[i:i + 1], index_name)
-                p,est = self.explain(data, **kwargs)
-                explanations.append(p)
+
+                mean, sigma, calc_r = self.explain(data, **kwargs)
+                explanations.append(mean)
+                sigmas.append(sigma)
+                calc_rs.append(calc_r)
 
             # vector-output
             s = explanations[0].shape
             if len(s) == 2:
                 outs = [np.zeros((X.shape[0], s[0])) for j in range(s[1])]
-
                 for i in range(X.shape[0]):
                     for j in range(s[1]):
                         outs[j][i] = explanations[i][:, j]
-                return outs, est
+
+                sig_outs = []
+
+
+                for i in range(len(sigmas)):
+                    for j in range(sigmas[i].shape[0]):
+                        sig_outs.append(sigmas[i][j])
+
+                return outs, sig_outs, calc_rs
 
             # single-output
             else:
                 out = np.zeros((X.shape[0], s[0]))
                 for i in range(X.shape[0]):
                     out[i] = explanations[i]
-                return out, est
+                return out
 
     def explain(self, incoming_instance, **kwargs):
         # convert incoming input to a standardized iml object
@@ -411,18 +420,19 @@ class KernelExplainer(Explainer):
             # solve then expand the feature importance (Shapley value) vector to contain the non-varying features
             phi = np.zeros((self.data.groups_size, self.D))
             phi_var = np.zeros((self.data.groups_size, self.D))
-            ests = []
+            sigma = []
             for d in range(self.D):
-                vphi, est2, vphi_var = self.solve(self.nsamples / self.max_samples, d)
+                vphi, vsigma, calc_r, vphi_var = self.solve(self.nsamples / self.max_samples, d)
                 phi[self.varyingInds, d] = vphi
+                sigma.append(vsigma)
                 phi_var[self.varyingInds, d] = vphi_var
-                ests.append(est2)
 
         if not self.vector_out:
             phi = np.squeeze(phi, axis=1)
             phi_var = np.squeeze(phi_var, axis=1)
 
-        return phi, ests
+        sigma = np.array(sigma)
+        return phi, sigma, calc_r
 
     def varying_groups(self, x):
         if not sp.sparse.issparse(x):
@@ -553,7 +563,7 @@ class KernelExplainer(Explainer):
             self.ey[i, :] = eyVal
             self.nsamplesRun += 1
 
-    def solve(self, fraction_evaluated, dim):
+    def solve(self, fraction_evaluated, dim, bayesian=True):
         eyAdj = self.linkfv(self.ey[:, dim]) - self.link.f(self.fnull[dim])
         s = np.sum(self.maskMatrix, 1)
 
@@ -587,13 +597,12 @@ class KernelExplainer(Explainer):
                 c = "aic" if self.l1_reg == "auto" else self.l1_reg
                 nonzero_inds = np.nonzero(LassoLarsIC(criterion=c).fit(mask_aug, eyAdj_aug).coef_)[0]
             
-
             # use a fixed regularization coeffcient
             else:
                 nonzero_inds = np.nonzero(Lasso(alpha=self.l1_reg).fit(mask_aug, eyAdj_aug).coef_)[0]
 
         if len(nonzero_inds) == 0:
-            return np.zeros(self.M), None, np.ones(self.M)
+            return np.zeros(self.M), np.zeros((self.M, self.M)), None, np.ones(self.M)
 
         # eliminate one variable with the constraint that all features sum to the output
         eyAdj2 = eyAdj - self.maskMatrix[:, nonzero_inds[-1]] * (
@@ -602,16 +611,20 @@ class KernelExplainer(Explainer):
         log.debug("etmp[:4,:] {0}".format(etmp[:4, :]))
 
         # solve a weighted least squares equation to estimate phi
-        tmp = np.transpose(np.transpose(etmp) * np.transpose(self.kernelWeights))
-        tmp2 = np.linalg.inv(np.dot(np.transpose(tmp), etmp))
-        w = np.dot(tmp2, np.dot(np.transpose(tmp), eyAdj2))
+        # OMITTED FOR BAYESIAN
+        # tmp = np.transpose(np.transpose(etmp) * np.transpose(self.kernelWeights))
+        # tmp2 = np.linalg.inv(np.dot(np.transpose(tmp), etmp))
+        # w = np.dot(tmp2, np.dot(np.transpose(tmp), eyAdj2))
+     
+        if etmp.shape[1] == 0:
+            w = np.array([])
+            cov = None
+        else:
+            br = BayesianRidge().fit(etmp, eyAdj2, sample_weight=self.kernelWeights)
+            w = br.coef_
+            cov = br.sigma_
 
-
-        X = sm.add_constant(etmp)
-        y = eyAdj2
-
-        EST = sm.WLS(y, X, weights=self.kernelWeights)
-        EST2 = EST.fit()
+        from numpy.random import multivariate_normal
 
         log.debug("np.sum(w) = {0}".format(np.sum(w)))
         log.debug("self.link(self.fx) - self.link(self.fnull) = {0}".format(
@@ -623,11 +636,33 @@ class KernelExplainer(Explainer):
         phi = np.zeros(self.M)
         phi[nonzero_inds[:-1]] = w
         phi[nonzero_inds[-1]] = (self.link.f(self.fx[dim]) - self.link.f(self.fnull[dim])) - sum(w)
+
+        # print (phi[nonzero_inds[-1]]) 
+        # print (self.link.f(self.fx[dim]))
+        # print (self.link.f(self.fnull[dim]))
+        # print (sum(w))
+
         log.info("phi = {0}".format(phi))
+
+        # Right now I'm dropping the last nonzeroindcs value covariance, I should probably do something with this variance!!
+
+
+        sigma = np.zeros((self.M, self.M))
+        for i,i_val in enumerate(nonzero_inds[:-1]):
+            for j, j_val in enumerate(nonzero_inds[:-1]):
+                sigma[i_val,j_val] = cov[i,j]
+
 
         # clean up any rounding errors
         for i in range(self.M):
             if np.abs(phi[i]) < 1e-10:
                 phi[i] = 0
 
-        return phi, EST2, np.ones(len(phi))
+        # if cov is not None:
+        #     print (self.M)
+        #     print (phi.shape)
+        #     print (br.sigma_.shape)
+
+        remainder = lambda w : (self.link.f(self.fx[dim]) - self.link.f(self.fnull[dim])) - sum(w)
+
+        return phi, sigma, remainder, np.ones(len(phi))
